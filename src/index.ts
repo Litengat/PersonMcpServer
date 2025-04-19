@@ -2,12 +2,22 @@ import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
 import { z } from "zod";
 
-const NWS_API_BASE = "https://api.weather.gov";
-const USER_AGENT = "weather-app/1.0";
+import "dotenv/config";
+import { drizzle } from "drizzle-orm/libsql";
+import {
+  personTable,
+  relationshipInfoTable,
+  relationshipTable,
+  relationshipTypes,
+} from "./db/schema.js";
+import { and, eq, or } from "drizzle-orm";
+import { db } from "./db/index.js";
+import { uuid } from "drizzle-orm/gel-core";
+import { text } from "stream/consumers";
 
 // Create server instance
 const server = new McpServer({
-  name: "weather",
+  name: "person",
   version: "1.0.0",
   capabilities: {
     resources: {},
@@ -15,117 +25,111 @@ const server = new McpServer({
   },
 });
 
-// Helper function for making NWS API requests
-async function makeNWSRequest<T>(url: string): Promise<T | null> {
-  const headers = {
-    "User-Agent": USER_AGENT,
-    Accept: "application/geo+json",
-  };
-
-  try {
-    const response = await fetch(url, { headers });
-    if (!response.ok) {
-      throw new Error(`HTTP error! status: ${response.status}`);
-    }
-    return (await response.json()) as T;
-  } catch (error) {
-    console.error("Error making NWS request:", error);
-    return null;
-  }
-}
-
-interface AlertFeature {
-  properties: {
-    event?: string;
-    areaDesc?: string;
-    severity?: string;
-    status?: string;
-    headline?: string;
-  };
-}
-
-// Format alert data
-function formatAlert(feature: AlertFeature): string {
-  const props = feature.properties;
-  return [
-    `Event: ${props.event || "Unknown"}`,
-    `Area: ${props.areaDesc || "Unknown"}`,
-    `Severity: ${props.severity || "Unknown"}`,
-    `Status: ${props.status || "Unknown"}`,
-    `Headline: ${props.headline || "No headline"}`,
-    "---",
-  ].join("\n");
-}
-
-interface ForecastPeriod {
-  name?: string;
-  temperature?: number;
-  temperatureUnit?: string;
-  windSpeed?: string;
-  windDirection?: string;
-  shortForecast?: string;
-}
-
-interface AlertsResponse {
-  features: AlertFeature[];
-}
-
-interface PointsResponse {
-  properties: {
-    forecast?: string;
-  };
-}
-
-interface ForecastResponse {
-  properties: {
-    periods: ForecastPeriod[];
-  };
-}
-// Register weather tools
 server.tool(
-  "get-alerts",
-  "Get weather alerts for a state",
+  "get-person",
+  "Get person details and overall information",
   {
-    state: z.string().length(2).describe("Two-letter state code (e.g. CA, NY)"),
+    firstname: z.string().describe("the person's first name"),
+    lastname: z.string().describe("the person's last name"),
   },
-  async ({ state }) => {
-    const stateCode = state.toUpperCase();
-    const alertsUrl = `${NWS_API_BASE}/alerts?area=${stateCode}`;
-    const alertsData = await makeNWSRequest<AlertsResponse>(alertsUrl);
-
-    if (!alertsData) {
+  async ({ firstname, lastname }: { firstname: string; lastname: string }) => {
+    const person = (
+      await db
+        .select()
+        .from(personTable)
+        .where(
+          and(
+            eq(personTable.firstname, firstname),
+            eq(personTable.lastname, lastname)
+          )
+        )
+    )[0];
+    if (!person) {
       return {
         content: [
           {
             type: "text",
-            text: "Failed to retrieve alerts data",
+            text: `Person ${firstname} ${lastname} not found.`,
           },
         ],
       };
     }
-
-    const features = alertsData.features || [];
-    if (features.length === 0) {
+    return {
+      content: [
+        {
+          type: "text",
+          text: `Person ${firstname} ${lastname} has the ${person.id} is born on ${person.birthdate} and works as ${person.job}.`,
+        },
+      ],
+    };
+  }
+);
+server.tool(
+  "get-person-by-id",
+  "Get person details and overall information by the id",
+  {
+    uuid: z.string().uuid().describe("the person's uuid"),
+  },
+  async ({ uuid }) => {
+    const person = (
+      await db.select().from(personTable).where(eq(personTable.id, uuid))
+    )[0];
+    if (!person) {
       return {
         content: [
           {
             type: "text",
-            text: `No active alerts for ${stateCode}`,
+            text: `Person ${uuid} not found.`,
           },
         ],
       };
     }
+    return {
+      content: [
+        {
+          type: "text",
+          text: `Person ${person.firstname} ${person.lastname} has the ${person.id} is born on ${person.birthdate} and works as ${person.job}.`,
+        },
+      ],
+    };
+  }
+);
+server.tool(
+  "get-relationship",
+  "Gets the relationship between two people",
+  {
+    personA: z.string().uuid().describe("the first person's uuid"),
+    personB: z.string().uuid().describe("the second person's uuid"),
+  },
+  async ({ personA, personB }) => {
+    const relationship = (
+      await db
+        .select()
+        .from(relationshipTable)
+        .where(
+          and(
+            eq(relationshipTable.personAId, personA),
+            eq(relationshipTable.personBId, personB)
+          )
+        )
+    )[0];
 
-    const formattedAlerts = features.map(formatAlert);
-    const alertsText = `Active alerts for ${stateCode}:\n\n${formattedAlerts.join(
-      "\n"
-    )}`;
+    const infos = await db
+      .select()
+      .from(relationshipInfoTable)
+      .where(eq(relationshipInfoTable.id, relationship.id));
 
     return {
       content: [
         {
           type: "text",
-          text: alertsText,
+          text: `Relationship between ${personA} and ${personB} has the id ${
+            relationship.id
+          } is of type ${
+            relationship.type
+          }, there are some additional information: ${infos
+            .map((info) => info.info)
+            .join(", ")}`,
         },
       ],
     };
@@ -133,103 +137,176 @@ server.tool(
 );
 
 server.tool(
-  "get-forecast",
-  "Get weather forecast for a location",
+  "create-person",
+  "Create a new person",
   {
-    latitude: z.number().min(-90).max(90).describe("Latitude of the location"),
-    longitude: z
-      .number()
-      .min(-180)
-      .max(180)
-      .describe("Longitude of the location"),
+    firstname: z.string().describe("the person's first name"),
+    lastname: z.string().describe("the person's last name"),
+    birthdate: z.string().describe("the person's birthdate"),
+    job: z.string().optional().describe("the person's job"),
+    sex: z.enum(["w", "m", "d"]).describe("the person's sex"),
   },
-  async ({ latitude, longitude }) => {
-    // Get grid point data
-    const pointsUrl = `${NWS_API_BASE}/points/${latitude.toFixed(
-      4
-    )},${longitude.toFixed(4)}`;
-    const pointsData = await makeNWSRequest<PointsResponse>(pointsUrl);
-
-    if (!pointsData) {
-      return {
-        content: [
-          {
-            type: "text",
-            text: `Failed to retrieve grid point data for coordinates: ${latitude}, ${longitude}. This location may not be supported by the NWS API (only US locations are supported).`,
-          },
-        ],
-      };
-    }
-
-    const forecastUrl = pointsData.properties?.forecast;
-    if (!forecastUrl) {
-      return {
-        content: [
-          {
-            type: "text",
-            text: "Failed to get forecast URL from grid point data",
-          },
-        ],
-      };
-    }
-
-    // Get forecast data
-    const forecastData = await makeNWSRequest<ForecastResponse>(forecastUrl);
-    if (!forecastData) {
-      return {
-        content: [
-          {
-            type: "text",
-            text: "Failed to retrieve forecast data",
-          },
-        ],
-      };
-    }
-
-    const periods = forecastData.properties?.periods || [];
-    if (periods.length === 0) {
-      return {
-        content: [
-          {
-            type: "text",
-            text: "No forecast periods available",
-          },
-        ],
-      };
-    }
-
-    // Format forecast periods
-    const formattedForecast = periods.map((period: ForecastPeriod) =>
-      [
-        `${period.name || "Unknown"}:`,
-        `Temperature: ${period.temperature || "Unknown"}°${
-          period.temperatureUnit || "F"
-        }`,
-        `Wind: ${period.windSpeed || "Unknown"} ${period.windDirection || ""}`,
-        `${period.shortForecast || "No forecast available"}`,
-        "---",
-      ].join("\n")
-    );
-
-    const forecastText = `Forecast for ${latitude}, ${longitude}:\n\n${formattedForecast.join(
-      "\n"
-    )}`;
-
+  async ({ firstname, lastname, birthdate, job, sex }) => {
+    const person = await db
+      .insert(personTable)
+      .values({
+        firstname,
+        lastname,
+        birthdate,
+        job,
+        sex,
+      })
+      .returning();
+    person[0].id;
     return {
       content: [
         {
           type: "text",
-          text: forecastText,
+          text: `Person ${firstname} ${lastname} created with id ${person[0].id}`,
         },
       ],
     };
   }
 );
+server.tool(
+  "create-relationship",
+  "Create a new relationship between to persons",
+  {
+    personAId: z.string().describe("the first person's id"),
+    personBId: z.string().describe("the second person's id"),
+    type: z.enum(relationshipTypes).describe("the type of relationship"),
+  },
+  async ({ personAId, personBId, type }) => {
+    const relationship = await db
+      .insert(relationshipTable)
+      .values({
+        personAId,
+        personBId,
+        type,
+      })
+      .returning();
+    return {
+      content: [
+        {
+          type: "text",
+          text: `Relationship between ${personAId} and ${personBId} created with id ${relationship[0].id}`,
+        },
+      ],
+    };
+  }
+);
+server.tool(
+  "add-information-relationship",
+  "Adds inforamtion to an existing relationship",
+  {
+    relationshipId: z.string().uuid().describe("the relationships uuid"),
+    info: z
+      .string()
+      .describe("the information that is added to the relationship"),
+  },
+  async ({ relationshipId, info }) => {
+    await db.insert(relationshipInfoTable).values({
+      relationshipId,
+      info,
+    });
+    return {
+      content: [
+        {
+          type: "text",
+          text: `Information ${info} added to relationship ${relationshipId}`,
+        },
+      ],
+    };
+  }
+);
+server.tool(
+  "get-information-relationship",
+  "gets the information of a relationship",
+  {
+    uuid: z.string().uuid().describe("The uuid of the relationship"),
+  },
+  async ({ uuid }) => {
+    const info = await db
+      .select()
+      .from(relationshipInfoTable)
+      .where(eq(relationshipInfoTable.relationshipId, uuid));
+    return {
+      content: [
+        {
+          type: "text",
+          text: `${info.map((info) => info.info).join(",")}`,
+        },
+      ],
+    };
+  }
+);
+server.tool("get-all-persons", "Get all persons", {}, async () => {
+  const persons = await db.select().from(personTable);
+  return {
+    content: [
+      {
+        type: "text",
+        text: `Persons: ${persons
+          .map((person) => `${person.firstname} ${person.lastname}`)
+          .join(", ")}`,
+      },
+    ],
+  };
+});
+server.tool(
+  "get-relationships",
+  "Get all relationships of a person",
+  {
+    personId: z
+      .string()
+      .uuid()
+      .describe("The uuid of the persons, with the relationships"),
+  },
+  async ({ personId }) => {
+    const relations = await db
+      .select()
+      .from(relationshipTable)
+      .where(
+        or(
+          eq(relationshipTable.personAId, personId),
+          eq(relationshipTable.personBId, personId)
+        )
+      );
+    return {
+      content: [
+        {
+          type: "text",
+          text: JSON.stringify(relations),
+        },
+      ],
+    };
+  }
+);
+
+// server.tool(
+//   "random-number",
+//   "Get a random number",
+//   {
+//     max: z.number().describe("the maximum number"),
+//     min: z.number().describe("the minimum number"),
+//   },
+//   async ({ max, min }) => {
+//     const random = Math.floor(Math.random() * (max - min + 1)) + min;
+//     return {
+//       content: [
+//         {
+//           type: "text",
+//           text: `the Random number ${random}`,
+//         },
+//       ],
+//     };
+//   }
+// );
 
 async function main() {
   const transport = new StdioServerTransport();
   await server.connect(transport);
-  console.error("Weather MCP Server running on stdio");
+  console.error(" MCP Server running on stdio");
 }
 
 main().catch((error) => {

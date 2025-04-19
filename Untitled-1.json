@@ -1,0 +1,7 @@
+{
+  "command": "node",
+  "args": ["/Users/litengut/Projects/testMCP/build/index.js"],
+  "env": {
+    "DATABASE_URL": "postgresql://postgres:e8pdxk5ZY3q57VYW@localhost:5432/person-graph"
+  }
+}
